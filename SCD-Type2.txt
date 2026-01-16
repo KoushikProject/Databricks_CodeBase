@@ -1,0 +1,500 @@
+SQL:
+----------
+
+Ex: HashCols = ['Col1', 'Col2', 'Col3']
+silver = silver.withColumn("Hash", lit(sha2(concat_ws("~", *HashCols), 256)))
+
+Here an example for a customer table. 
+ 
+The source_table contains new or updated customer data, and the target_table is the Delta table that maintains historical records.
+ 
+Table Structures
+source_table: contains the latest customer data.
+customer_id: Unique identifier for the customer.
+name: Customer's name.
+address: Customer's address.
+email: Customer's email.
+phone: Customer's phone number.
+ 
+target_table: contains the historical customer data.
+customer_id: Unique identifier for the customer.
+name: Customer's name.
+address: Customer's address.
+email: Customer's email.
+phone: Customer's phone number.
+valid_from: Date when the record became effective.
+valid_to: Date until the record is effective.
+is_current: Flag indicating the current active record.
+hash_value: Hash of the attributes to detect changes.
+ 
+WITH source_with_hash AS (
+  SELECT 
+    customer_id,
+    name,
+    address,
+    email,
+    phone,
+    md5(concat_ws('|', name, address, email, phone)) AS hash_value
+  FROM source_table
+)
+ 
+MERGE INTO target_table AS target
+USING source_with_hash AS source
+ON target.customer_id = source.customer_id
+AND target.is_current = true
+ 
+WHEN MATCHED AND target.hash_value != source.hash_value THEN
+  UPDATE SET
+    target.valid_to = current_date - 1,
+    target.is_current = false
+ 
+WHEN NOT MATCHED BY TARGET THEN
+  INSERT (customer_id, name, address, email, phone, valid_from, valid_to, is_current, hash_value)
+  VALUES (source.customer_id, source.name, source.address, source.email, source.phone, current_date, '9999-12-31', true, source.hash_value)
+ 
+WHEN NOT MATCHED BY SOURCE AND target.is_current = true THEN
+  UPDATE SET
+    target.valid_to = current_date - 1,
+    target.is_current = false;
+ 
+Here the explanation about all parts of the sentence.
+ 
+WITH Clause:
+Creates a subquery source_with_hash that adds a hash_value column to the source_table. This column contains an MD5 hash of the relevant attributes to detect changes.
+ 
+MATCHED Clause:
+Handles updates where there are changes in the source data (source.hash_value is different from target.hash_value).
+Updates the valid_to date of the current record in the target table to the previous day and sets is_current to false.
+ 
+NOT MATCHED BY TARGET Clause:
+Inserts new records that do not exist in the target table.
+Inserts the new records with valid_from set to the current date, valid_to set to '9999-12-31', and is_current set to true.
+ 
+NOT MATCHED BY SOURCE Clause:
+Handles records that are in the target table but not in the source table (optional, if you want to handle deletions).
+Updates the valid_to date to the previous day and sets is_current to false.
+ 
+You only have to adjust the column names and logic according to your specific schema and requirements.
+
+NEW CODE:
+----------------
+
+MERGE INTO target_table AS target
+USING (
+    /* Build source + special rows for change handling */
+    SELECT
+        customer_id,
+        name,
+        address,
+        email,
+        phone,
+        md5(
+            concat_ws(
+                '|',
+                coalesce(name, ''),
+                coalesce(address, ''),
+                coalesce(email, ''),
+                coalesce(phone, '')
+            )
+        ) AS hash_value,
+        'SRC' AS record_type
+    FROM source_table
+ 
+    UNION ALL
+ 
+    /* Duplicate rows ONLY to force insert for changed records */
+    SELECT
+        s.customer_id,
+s.name,
+        s.address,
+s.email,
+        s.phone,
+        md5(
+            concat_ws(
+                '|',
+coalesce(s.name, ''),
+                coalesce(s.address, ''),
+coalesce(s.email, ''),
+                coalesce(s.phone, '')
+            )
+        ) AS hash_value,
+        'CHG' AS record_type
+    FROM source_table s
+    JOIN target_table t
+      ON s.customer_id = t.customer_id
+     AND t.is_current = true
+     AND t.hash_value <> md5(
+            concat_ws(
+                '|',
+coalesce(s.name, ''),
+                coalesce(s.address, ''),
+coalesce(s.email, ''),
+                coalesce(s.phone, '')
+            )
+        )
+) AS source
+ON target.customer_id = source.customer_id
+AND target.is_current = true
+AND source.record_type = 'SRC'
+ 
+/* 1️⃣ Expire changed records */
+WHEN MATCHED
+AND target.hash_value <> source.hash_value
+THEN UPDATE SET
+    target.valid_to   = current_date - 1,
+    target.is_current = false
+ 
+/* 2️⃣ Expire deleted records */
+WHEN NOT MATCHED BY SOURCE
+AND target.is_current = true
+THEN UPDATE SET
+    target.valid_to   = current_date - 1,
+    target.is_current = false
+ 
+/* 3️⃣ Insert new + changed records */
+WHEN NOT MATCHED
+AND source.record_type IN ('SRC', 'CHG')
+THEN INSERT (
+    customer_id,
+    name,
+    address,
+    email,
+    phone,
+    valid_from,
+    valid_to,
+    is_current,
+    hash_value
+)
+VALUES (
+    source.customer_id,
+source.name,
+    source.address,
+source.email,
+    source.phone,
+    current_date,
+    DATE '9999-12-31',
+    true,
+    source.hash_value
+);
+
+Without Hash:
+----------------
+WORKING SOLUTION:
+---------------------
+%sql
+MERGE INTO databrickskoushik27012001.silver.dim_emplyees_demo tgt
+USING (
+    -- source rows joined with current DIM to detect changes
+    SELECT
+        emp_id,
+        emp_name,
+        emp_city,
+        emp_state,
+        emp_pincode,
+        'SRC' AS record_type
+    FROM databrickskoushik27012001.silver.stage_employees_demo
+ 
+    UNION ALL
+
+    SELECT
+        s.emp_id,
+        s.emp_name,
+        s.emp_city,
+        s.emp_state,
+        s.emp_pincode,
+        'CHG' AS record_type
+    FROM databrickskoushik27012001.silver.stage_employees_demo s
+    JOIN databrickskoushik27012001.silver.dim_emplyees_demo t
+      ON s.emp_id = t.emp_id
+     AND t.is_current = true
+     AND  (
+        t.emp_name <> s.emp_name OR
+         t.emp_city <> s.emp_city OR
+        t.emp_state <> s.emp_state OR
+         t.emp_pincode   <> s.emp_pincode
+     )
+) src
+ON tgt.emp_id = src.emp_id AND tgt.is_current = 'Y' AND src.record_type = 'SRC'
+
+-- 1️⃣ Expire old records (matched rows with changes)
+WHEN MATCHED AND (
+     tgt.emp_name    <> src.emp_name OR
+     tgt.emp_city    <> src.emp_city OR
+     tgt.emp_state   <> src.emp_state OR
+     tgt.emp_pincode <> src.emp_pincode
+)
+THEN UPDATE SET
+  tgt.effective_end_date = current_date(),
+  tgt.is_current = 'N'
+
+-- 2️⃣ Insert new or changed records
+WHEN NOT MATCHED AND src.record_type IN ('SRC','CHG') THEN
+INSERT (
+  emp_id,
+  emp_name,
+  emp_city,
+  emp_state,
+  emp_pincode,
+  effective_start_date,
+  effective_end_date,
+  is_current
+)
+VALUES (
+  src.emp_id,
+  src.emp_name,
+  src.emp_city,
+  src.emp_state,
+  src.emp_pincode,
+  current_date(),
+  NULL,
+  'Y'
+)
+
+WHEN NOT MATCHED BY SOURCE
+AND tgt.is_current = 'Y'
+THEN UPDATE SET
+    tgt.effective_end_date   = current_date() - 1,
+    tgt.is_current = 'N';
+
+===========================================================================================================================================
+PYSPARK:
+--------------
+
+also, in PySpark, the same example in pyspark:
+
+from pyspark.sql.functions import col, concat_ws, current_date, lit, md5
+
+source_df = spark.table("source_table")
+target_df = spark.table("target_table")
+
+source_with_hash_df = source_df.withColumn("hash_value", md5(concat_ws("|", col("name"), col("address"),  col("email"), col("phone"))))
+
+target_df.alias("target").merge(
+source_with_hash_df.alias("source"),
+"target.customer_id = source.customer_id AND target.is_current = true"
+).whenMatchedUpdate(
+condition="target.hash_value != source.hash_value",
+set={
+"valid_to": current_date() - 1,
+"is_current": lit(False)
+}
+).whenNotMatchedInsert(
+values={
+"customer_id": col("source.customer_id"),
+"name": col("source.name"),
+"address": col("source.address"),
+"email": col("source.email"),
+"phone": col("source.phone"),
+"valid_from": current_date(),
+"valid_to": lit("9999-12-31"),
+"is_current": lit(True),
+"hash_value": col("source.hash_value")
+}
+).whenNotMatchedBySourceUpdate(
+condition="target.is_current = true",
+set={
+"valid_to": current_date() - 1,
+"is_current": lit(False)
+}
+)
+
+You have to add an action to execute.
+
+NEW CODE:
+----------------
+
+from pyspark.sql.functions import (
+    col, concat_ws, current_date, lit, md5, coalesce
+)
+from delta.tables import DeltaTable
+ 
+# Load tables
+source_df = spark.table("source_table")
+target_dt = DeltaTable.forName(spark, "target_table")
+ 
+# -----------------------------
+# Source with hash
+# -----------------------------
+source_with_hash_df = source_df.withColumn(
+    "hash_value",
+    md5(
+        concat_ws(
+            "|",
+            coalesce(col("name"), lit("")),
+            coalesce(col("address"), lit("")),
+            coalesce(col("email"), lit("")),
+            coalesce(col("phone"), lit(""))
+        )
+    )
+)
+ 
+# -----------------------------
+# Changed rows (for re-insert)
+# -----------------------------
+changed_rows_df = (
+    source_with_hash_df.alias("s")
+    .join(
+        spark.table("target_table").alias("t"),
+        (col("s.customer_id") == col("t.customer_id")) &
+        (col("t.is_current") == lit(True)) &
+        (col("s.hash_value") != col("t.hash_value")),
+        "inner"
+    )
+)
+ 
+# -----------------------------
+# Union source + changed rows
+# -----------------------------
+merge_source_df = (
+    source_with_hash_df
+        .withColumn("record_type", lit("SRC"))
+    .unionByName(
+        changed_rows_df
+            .withColumn("record_type", lit("CHG"))
+    )
+)
+ 
+# -----------------------------
+# SINGLE MERGE
+# -----------------------------
+(
+    target_dt.alias("target")
+    .merge(
+        merge_source_df.alias("source"),
+        """
+        target.customer_id = source.customer_id
+        AND target.is_current = true
+        AND source.record_type = 'SRC'
+        """
+    )
+ 
+    # 1️⃣ Expire changed records
+    .whenMatchedUpdate(
+        condition="target.hash_value <> source.hash_value",
+        set={
+            "valid_to": current_date() - 1,
+            "is_current": lit(False)
+        }
+    )
+ 
+    # 2️⃣ Expire deleted records
+    .whenNotMatchedBySourceUpdate(
+        condition="target.is_current = true",
+        set={
+            "valid_to": current_date() - 1,
+            "is_current": lit(False)
+        }
+    )
+ 
+    # 3️⃣ Insert new + changed records
+    .whenNotMatchedInsert(
+        condition="source.record_type IN ('SRC','CHG')",
+        values={
+            "customer_id": col("source.customer_id"),
+"name": col("source.name"),
+            "address": col("source.address"),
+"email": col("source.email"),
+            "phone": col("source.phone"),
+            "valid_from": current_date(),
+            "valid_to": lit("9999-12-31"),
+            "is_current": lit(True),
+            "hash_value": col("source.hash_value")
+        }
+    )
+    .execute()
+)
+
+===========================================================================================================================================================================
+Without Hash method:
+----------------------------
+
+from pyspark.sql.functions import col, lit, current_date
+from delta.tables import DeltaTable
+ 
+# Load tables
+source_df = spark.table("source_table")
+target_dt = DeltaTable.forName(spark, "target_table")
+ 
+# -----------------------------
+# Changed rows (to force insert)
+# -----------------------------
+changed_rows_df = (
+    source_df.alias("s")
+    .join(
+        spark.table("target_table").alias("t"),
+        (col("s.customer_id") == col("t.customer_id")) &
+        (col("t.is_current") == lit(True)) &
+        (
+(col("s.name") != col("t.name")) |
+            (col("s.address") != col("t.address")) |
+(col("s.email") != col("t.email")) |
+            (col("s.phone")   != col("t.phone"))
+        ),
+        "inner"
+    )
+)
+ 
+# -----------------------------
+# Union source + changed rows
+# -----------------------------
+merge_source_df = (
+    source_df
+        .withColumn("record_type", lit("SRC"))
+    .unionByName(
+        changed_rows_df.withColumn("record_type", lit("CHG"))
+    )
+)
+ 
+# -----------------------------
+# SINGLE MERGE
+# -----------------------------
+(
+    target_dt.alias("t")
+    .merge(
+        merge_source_df.alias("s"),
+        """
+        t.customer_id = s.customer_id
+        AND t.is_current = true
+        AND s.record_type = 'SRC'
+        """
+    )
+ 
+    # 1️⃣ Expire changed records
+    .whenMatchedUpdate(
+        condition="""
+t.name <> s.name OR
+            t.address <> s.address OR
+t.email <> s.email OR
+            t.phone   <> s.phone
+        """,
+        set={
+            "valid_to": current_date() - 1,
+            "is_current": lit(False)
+        }
+    )
+ 
+    # 2️⃣ Expire deleted records
+    .whenNotMatchedBySourceUpdate(
+        condition="t.is_current = true",
+        set={
+            "valid_to": current_date() - 1,
+            "is_current": lit(False)
+        }
+    )
+ 
+    # 3️⃣ Insert new + changed records
+    .whenNotMatchedInsert(
+        condition="s.record_type IN ('SRC','CHG')",
+        values={
+            "customer_id": col("s.customer_id"),
+"name": col("s.name"),
+            "address": col("s.address"),
+"email": col("s.email"),
+            "phone": col("s.phone"),
+            "valid_from": current_date(),
+            "valid_to": lit("9999-12-31"),
+            "is_current": lit(True)
+        }
+    )
+    .execute()
+)
